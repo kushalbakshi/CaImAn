@@ -1354,8 +1354,10 @@ def init_cuda_process():
 
     cudadrv.init()
     dev = cudadrv.Device(0)
-    cudactx = dev.make_context() # type: ignore
-    atexit.register(cudactx.pop) # type: ignore
+    cudactx = dev.retain_primary_context()
+    cudactx.push()
+    atexit.register(cudactx.pop)  # type: ignore
+
 
 
 def close_cuda_process(n):
