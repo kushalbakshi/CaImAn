@@ -45,11 +45,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numpy.fft import ifftshift
 import os
+import scipy
+import scipy.interpolate
+from skimage.transform import resize as resize_sk, rescale as rescale_sk, warp as warp_sk
 import sys
 import tifffile
-from typing import Optional
-from skimage.transform import resize as resize_sk
-from skimage.transform import warp as warp_sk
+from tqdm import tqdm
+from typing import Optional, Literal, Union
 
 import caiman
 import caiman.base.movies
@@ -67,16 +69,6 @@ try:
 except:
     def profile(a): return a
 
-opencv = True
-
-try:
-    import pycuda.gpuarray as gpuarray
-    import pycuda.driver as cudadrv
-    import atexit
-    HAS_CUDA = True
-except ImportError:
-    HAS_CUDA = False
-
 class MotionCorrect(object):
     """
         class implementing motion correction operations
@@ -85,8 +77,8 @@ class MotionCorrect(object):
     def __init__(self, fname, min_mov=None, dview=None, max_shifts=(6, 6), niter_rig=1, splits_rig=14, num_splits_to_process_rig=None,
                  strides=(96, 96), overlaps=(32, 32), splits_els=14, num_splits_to_process_els=None,
                  upsample_factor_grid=4, max_deviation_rigid=3, shifts_opencv=True, nonneg_movie=True, gSig_filt=None,
-                 use_cuda=False, border_nan=True, pw_rigid=False, num_frames_split=80, var_name_hdf5='mov',is3D=False,
-                 indices=(slice(None), slice(None))):
+                 use_cuda=False, border_nan=True, pw_rigid=False, num_frames_split=80, var_name_hdf5='mov', is3D=False,
+                 indices=(slice(None), slice(None)), shifts_interpolate=False):
         """
         Constructor class for motion correction operations
 
@@ -103,11 +95,11 @@ class MotionCorrect(object):
            max_shifts: tuple
                maximum allow rigid shift
 
-           niter_rig':int
+           niter_rig:int
                maximum number of iterations rigid motion correction, in general is 1. 0
                will quickly initialize a template with the first frames
 
-           splits_rig': int
+           splits_rig: int
             for parallelization split the movies in  num_splits chunks across time
 
            num_splits_to_process_rig: list,
@@ -120,13 +112,10 @@ class MotionCorrect(object):
            overlaps: tuple
                overlap between patches (size of patch strides+overlaps)
 
-           pw_rigig: bool, default: False
-               flag for performing motion correction when calling motion_correct
-
            splits_els':list
                for parallelization split the movies in  num_splits chunks across time
 
-           num_splits_to_process_els: UNUSED
+           num_splits_to_process_els: UNUSED, deprecated
                Legacy parameter, does not do anything
 
            upsample_factor_grid:int,
@@ -135,19 +124,25 @@ class MotionCorrect(object):
            max_deviation_rigid:int
                maximum deviation allowed for patch with respect to rigid shift
 
-           shifts_opencv: Bool
+           shifts_opencv: bool
                apply shifts fast way (but smoothing results)
 
-           nonneg_movie: boolean
+           nonneg_movie: bool
                make the SAVED movie and template mostly nonnegative by removing min_mov from movie
 
-           use_cuda : bool, optional
-               Use skcuda.fft (if available). Default: False
+           gSig_filt: list[int], default None
+               if specified, indicates the shape of a Gaussian kernel used to perform high-pass spatial filtering of the video frames before performing motion correction. Useful for data with high background to emphasize landmarks. 
+
+           use_cuda : bool (DEPRECATED)
+               cuda is no longer supported for motion correction; this kwarg will be removed in a future version of Caiman
 
            border_nan : bool or string, optional
                Specifies how to deal with borders. (True, False, 'copy', 'min')
                TODO: make this just the bool, and make another variable called
                      border_strategy to hold the how
+
+           pw_rigid: bool, default: False
+               flag for performing elastic motion correction when calling motion_correct
 
            num_frames_split: int, default: 80
                Number of frames in each batch. Used when constructing the options
@@ -156,21 +151,25 @@ class MotionCorrect(object):
            var_name_hdf5: str, default: 'mov'
                If loading from hdf5, name of the variable to load
 
-            is3D: bool, default: False
+           is3D: bool, default: False
                Flag for 3D motion correction
 
-            indices: tuple(slice), default: (slice(None), slice(None))
+           indices: tuple(slice), default: (slice(None), slice(None))
                Use that to apply motion correction only on a part of the FOV
+            
+           shifts_interpolate: bool, default: False
+               use patch locations to interpolate shifts rather than just upscaling to size of image (for pw_rigid only)
 
        Returns:
            self
 
         """
+        logger = logging.getLogger("caiman")
         if 'ndarray' in str(type(fname)) or isinstance(fname, caiman.base.movies.movie):
             mc_tempfile = caiman.paths.fn_relocated('tmp_mov_mot_corr.hdf5')
             if os.path.isfile(mc_tempfile):
                 os.remove(mc_tempfile)
-            logging.info(f"Creating file for motion correction: {mc_tempfile}")
+            logger.info(f"Creating file for motion correction: {mc_tempfile}")
             caiman.movie(fname).save(mc_tempfile)
             fname = [mc_tempfile]
 
@@ -201,8 +200,9 @@ class MotionCorrect(object):
         self.var_name_hdf5 = var_name_hdf5
         self.is3D = bool(is3D)
         self.indices = indices
-        if self.use_cuda and not HAS_CUDA:
-            logging.debug("pycuda is unavailable. Falling back to default FFT.")
+        self.shifts_interpolate = shifts_interpolate
+        if self.use_cuda:
+            logger.warn("cuda is no longer supported; this kwarg will be removed in a future version of caiman")
 
     def motion_correct(self, template=None, save_movie=False):
         """general function for performing all types of motion correction. The
@@ -257,7 +257,7 @@ class MotionCorrect(object):
         self.mmap_file = self.fname_tot_els if self.pw_rigid else self.fname_tot_rig
         return self
 
-    def motion_correct_rigid(self, template=None, save_movie=False) -> None:
+    def motion_correct_rigid(self, template: Optional[np.ndarray] = None, save_movie=False) -> None:
         """
         Perform rigid motion correction
 
@@ -277,8 +277,10 @@ class MotionCorrect(object):
 
             self.shifts_rig: shifts in x and y (and z if 3D) per frame
         """
-        logging.debug('Entering Rigid Motion Correction')
-        logging.debug(-self.min_mov)  # XXX why the minus?
+        logger = logging.getLogger("caiman")
+
+        logger.debug('Entering Rigid Motion Correction')
+        logger.debug(f"{self.min_mov=}")
         self.total_template_rig = template
         self.templates_rig:list = []
         self.fname_tot_rig:list = []
@@ -302,7 +304,8 @@ class MotionCorrect(object):
                 border_nan=self.border_nan,
                 var_name_hdf5=self.var_name_hdf5,
                 is3D=self.is3D,
-                indices=self.indices)
+                indices=self.indices,
+                shifts_interpolate=self.shifts_interpolate)
             if template is None:
                 self.total_template_rig = _total_template_rig
 
@@ -310,7 +313,7 @@ class MotionCorrect(object):
             self.fname_tot_rig += [_fname_tot_rig]
             self.shifts_rig += _shifts_rig
 
-    def motion_correct_pwrigid(self, save_movie:bool=True, template:np.ndarray=None, show_template:bool=False) -> None:
+    def motion_correct_pwrigid(self, save_movie:bool=True, template: Optional[np.ndarray] = None, show_template:bool=False) -> None:
         """Perform pw-rigid motion correction
 
         Args:
@@ -320,7 +323,7 @@ class MotionCorrect(object):
             template: ndarray 2D (or 3D)
                 if known, one can pass a template to register the frames to
 
-            show_template: boolean
+            show_template: bool
                 whether to show the updated template at each iteration
 
         Important Fields:
@@ -336,10 +339,11 @@ class MotionCorrect(object):
         Raises:
             Exception: 'Error: Template contains NaNs, Please review the parameters'
         """
+        logger = logging.getLogger("caiman")
 
         num_iter = 1
         if template is None:
-            logging.info('Generating template by rigid motion correction')
+            logger.info('Generating template by rigid motion correction')
             self.motion_correct_rigid()
             self.total_template_els = self.total_template_rig.copy()
         else:
@@ -362,7 +366,7 @@ class MotionCorrect(object):
                     num_splits_to_process=None, num_iter=num_iter, template=self.total_template_els,
                     shifts_opencv=self.shifts_opencv, save_movie=save_movie, nonneg_movie=self.nonneg_movie, gSig_filt=self.gSig_filt,
                     use_cuda=self.use_cuda, border_nan=self.border_nan, var_name_hdf5=self.var_name_hdf5, is3D=self.is3D,
-                    indices=self.indices)
+                    indices=self.indices, shifts_interpolate=self.shifts_interpolate)
             if not self.is3D:
                 if show_template:
                     plt.imshow(new_template_els)
@@ -382,8 +386,8 @@ class MotionCorrect(object):
                 self.z_shifts_els += _z_shifts_els
             self.coord_shifts_els += _coord_shifts_els
 
-    def apply_shifts_movie(self, fname, rigid_shifts:bool=None, save_memmap:bool=False,
-                           save_base_name:str='MC', order:str='F', remove_min:bool=True):
+    def apply_shifts_movie(self, fname, rigid_shifts: Optional[bool] = None, save_memmap:bool=False,
+                           save_base_name:str='MC', order: Literal['C', 'F'] = 'F', remove_min:bool=True):
         """
         Applies shifts found by registering one file to a different file. Useful
         for cases when shifts computed from a structural channel are applied to a
@@ -415,6 +419,7 @@ class MotionCorrect(object):
             m_reg: caiman movie object
                 caiman movie object with applied shifts (not memory mapped)
         """
+        logger = logging.getLogger("caiman")
 
         Y = caiman.load(fname).astype(np.float32)
         if remove_min: 
@@ -423,7 +428,7 @@ class MotionCorrect(object):
                 Y -= Y.min()
 
         if rigid_shifts is not None:
-            logging.warning('The rigid_shifts flag is deprecated and it is ' +
+            logger.warning('The rigid_shifts flag is deprecated and it is ' +
                             'being ignored. The value is read directly from' +
                             ' mc.pw_rigid and is currently set to the opposite' +
                             f' of {self.pw_rigid}')
@@ -441,82 +446,28 @@ class MotionCorrect(object):
                     sh[0], sh[1]), 0, is_freq=False, border_nan=self.border_nan) for img, sh in zip(
                     Y, self.shifts_rig)]
         else:
+            # take potential upsampling into account when recreating patch grid
+            dims = Y.shape[1:]
+            patch_centers = get_patch_centers(dims, overlaps=self.overlaps, strides=self.strides,
+                                              shifts_opencv=self.shifts_opencv, upsample_factor_grid=self.upsample_factor_grid)
             if self.is3D:
-                xyz_grid = [(it[0], it[1], it[2]) for it in sliding_window_3d(
-                            Y[0], self.overlaps, self.strides)]
-                dims_grid = tuple(np.add(xyz_grid[-1], 1))
-                shifts_x = np.stack([np.reshape(_sh_, dims_grid, order='C').astype(
-                    np.float32) for _sh_ in self.x_shifts_els], axis=0)
-                shifts_y = np.stack([np.reshape(_sh_, dims_grid, order='C').astype(
-                    np.float32) for _sh_ in self.y_shifts_els], axis=0)
-                shifts_z = np.stack([np.reshape(_sh_, dims_grid, order='C').astype(
-                    np.float32) for _sh_ in self.z_shifts_els], axis=0)
-                dims = Y.shape[1:]
-                x_grid, y_grid, z_grid = np.meshgrid(np.arange(0., dims[1]).astype(
-                    np.float32), np.arange(0., dims[0]).astype(np.float32),
-                    np.arange(0., dims[2]).astype(np.float32))
-                if self.border_nan is not False:
-                    if self.border_nan is True:
-                        m_reg = [warp_sk(img, np.stack((resize_sk(shiftX.astype(np.float32), dims) + y_grid,
-                                                        resize_sk(shiftY.astype(np.float32), dims) + x_grid,
-                                                        resize_sk(shiftZ.astype(np.float32), dims) + z_grid), axis=0),
-                                         order=3, mode='constant', cval=np.nan)
-                                 for img, shiftX, shiftY, shiftZ in zip(Y, shifts_x, shifts_y, shifts_z)]
-                    elif self.border_nan == 'min':
-                        m_reg = [warp_sk(img, np.stack((resize_sk(shiftX.astype(np.float32), dims) + y_grid,
-                                                        resize_sk(shiftY.astype(np.float32), dims) + x_grid,
-                                                        resize_sk(shiftZ.astype(np.float32), dims) + z_grid), axis=0),
-                                         order=3, mode='constant', cval=np.min(img))
-                                 for img, shiftX, shiftY, shiftZ in zip(Y, shifts_x, shifts_y, shifts_z)]
-                    elif self.border_nan == 'copy':
-                        m_reg = [warp_sk(img, np.stack((resize_sk(shiftX.astype(np.float32), dims) + y_grid,
-                                                        resize_sk(shiftY.astype(np.float32), dims) + x_grid,
-                                                        resize_sk(shiftZ.astype(np.float32), dims) + z_grid), axis=0),
-                                         order=3, mode='edge')
-                                 for img, shiftX, shiftY, shiftZ in zip(Y, shifts_x, shifts_y, shifts_z)]
-                else:
-                    m_reg = [warp_sk(img, np.stack((resize_sk(shiftX.astype(np.float32), dims) + y_grid,
-                                     resize_sk(shiftY.astype(np.float32), dims) + x_grid,
-                                     resize_sk(shiftZ.astype(np.float32), dims) + z_grid), axis=0),
-                                     order=3, mode='constant')
-                             for img, shiftX, shiftY, shiftZ in zip(Y, shifts_x, shifts_y, shifts_z)]
-                                     # borderValue=add_to_movie)                                 # borderValue=add_to_movie)
-            else:
-                xy_grid = [(it[0], it[1]) for it in sliding_window(Y[0], self.overlaps, self.strides)]
-                dims_grid = tuple(np.max(np.stack(xy_grid, axis=1), axis=1) - np.min(
-                    np.stack(xy_grid, axis=1), axis=1) + 1)
-                shifts_x = np.stack([np.reshape(_sh_, dims_grid, order='C').astype(
-                    np.float32) for _sh_ in self.x_shifts_els], axis=0)
-                shifts_y = np.stack([np.reshape(_sh_, dims_grid, order='C').astype(
-                    np.float32) for _sh_ in self.y_shifts_els], axis=0)
-                dims = Y.shape[1:]
-                x_grid, y_grid = np.meshgrid(np.arange(0., dims[1]).astype(
-                    np.float32), np.arange(0., dims[0]).astype(np.float32))
-                if self.border_nan is not False:
-                    if self.border_nan is True:
-                        m_reg = [cv2.remap(img, -cv2.resize(shiftY, dims[::-1]) + x_grid,
-                                           -cv2.resize(shiftX, dims[::-1]) + y_grid,
-                                           cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
-                                           borderValue=np.nan)
-                                 for img, shiftX, shiftY in zip(Y, shifts_x, shifts_y)]
+                # x_shifts_els and y_shifts_els are switched intentionally
+                m_reg = [
+                    apply_pw_shifts_remap_3d(img, shifts_y=-x_shifts, shifts_x=-y_shifts, shifts_z=-z_shifts,
+                                             patch_centers=patch_centers, border_nan=self.border_nan,
+                                             shifts_interpolate=self.shifts_interpolate)
+                    for img, x_shifts, y_shifts, z_shifts in zip(Y, self.x_shifts_els, self.y_shifts_els, self.z_shifts_els)
+                ]
 
-                    elif self.border_nan == 'min':
-                        m_reg = [cv2.remap(img, -cv2.resize(shiftY, dims[::-1]) + x_grid,
-                                           -cv2.resize(shiftX, dims[::-1]) + y_grid,
-                                           cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
-                                           borderValue=np.min(img))
-                                 for img, shiftX, shiftY in zip(Y, shifts_x, shifts_y)]
-                    elif self.border_nan == 'copy':
-                        m_reg = [cv2.remap(img, -cv2.resize(shiftY, dims[::-1]) + x_grid,
-                                           -cv2.resize(shiftX, dims[::-1]) + y_grid,
-                                           cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                                 for img, shiftX, shiftY in zip(Y, shifts_x, shifts_y)]
-                else:
-                    m_reg = [cv2.remap(img, -cv2.resize(shiftY, dims[::-1]) + x_grid,
-                                       -cv2.resize(shiftX, dims[::-1]) + y_grid,
-                                       cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT,
-                                       borderValue=0.0)
-                             for img, shiftX, shiftY in zip(Y, shifts_x, shifts_y)]
+            else:
+                # x_shifts_els and y_shifts_els are switched intentionally
+                m_reg = [
+                    apply_pw_shifts_remap_2d(img, shifts_y=-x_shifts, shifts_x=-y_shifts, patch_centers=patch_centers,
+                                             border_nan=self.border_nan, shifts_interpolate=self.shifts_interpolate)
+                    for img, x_shifts, y_shifts in zip(Y, self.x_shifts_els, self.y_shifts_els)
+                ]
+
+        del Y
         m_reg = np.stack(m_reg, axis=0)
         if save_memmap:
             dims = m_reg.shape
@@ -530,12 +481,12 @@ class MotionCorrect(object):
         else:
             return caiman.movie(m_reg)
 
-def apply_shift_iteration(img, shift, border_nan:bool=False, border_type=cv2.BORDER_REFLECT):
+def apply_shift_iteration(img, shift, border_nan=False, border_type=cv2.BORDER_REFLECT):
     # todo todocument
 
     sh_x_n, sh_y_n = shift
     w_i, h_i = img.shape
-    M = np.float32([[1, 0, sh_y_n], [0, 1, sh_x_n]])
+    M = np.array([[1, 0, sh_y_n], [0, 1, sh_x_n]], dtype=np.float32)
     min_, max_ = np.nanmin(img), np.nanmax(img)
     img = np.clip(cv2.warpAffine(img, M, (h_i, w_i),
                                  flags=cv2.INTER_CUBIC, borderMode=border_type), min_, max_)
@@ -568,10 +519,12 @@ def apply_shift_iteration(img, shift, border_nan:bool=False, border_type=cv2.BOR
                 img[:, :max_w] = img[:, max_w, np.newaxis]
             if min_w < 0:
                 img[:, min_w:] = img[:, min_w-1, np.newaxis]
+        else:
+            logging.warning(f'Unknown value of border_nan ({border_nan}); treating as False')
 
     return img
 
-def apply_shift_online(movie_iterable, xy_shifts, save_base_name=None, order='F'):
+def apply_shift_online(movie_iterable, xy_shifts, save_base_name=None, order: Literal['C', 'F'] = 'F'):
     """
     Applies rigid shifts to a loaded movie. Useful when processing a dataset
     with CaImAn online and you want to obtain the registered movie after
@@ -750,6 +703,7 @@ def motion_correct_oneP_nonrigid(
     return mc
 
 def motion_correct_online_multifile(list_files, add_to_movie, order='C', **kwargs):
+    logger = logging.getLogger("caiman")
     # todo todocument
 
     kwargs['order'] = order
@@ -762,7 +716,7 @@ def motion_correct_online_multifile(list_files, add_to_movie, order='C', **kwarg
     kwargs_['order'] = order
     total_frames = 0
     for file_ in list_files:
-        logging.info(('Processing:' + file_))
+        logger.info('Processing: {file_}')
         kwargs_['template'] = template
         kwargs_['save_base_name'] = os.path.splitext(file_)[0]
         tffl = tifffile.TiffFile(file_)
@@ -776,11 +730,12 @@ def motion_correct_online_multifile(list_files, add_to_movie, order='C', **kwarg
 
     return all_names, all_shifts, all_xcorrs, all_templates
 
-def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shift_h=25, save_base_name=None, order='C',
+def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shift_h=25, save_base_name=None, order: Literal['F', 'C']='C',
                           init_frames_template=100, show_movie=False, bilateral_blur=False, template=None, min_count=1000,
                           border_to_0=0, n_iter=1, remove_blanks=False, show_template=False, return_mov=False,
                           use_median_as_template=False):
     # todo todocument
+    logger = logging.getLogger("caiman")
 
     shifts = []  # store the amount of shift in each frame
     xcorrs = []
@@ -790,7 +745,7 @@ def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shif
 
     if 'tifffile' in str(type(movie_iterable[0])):
         if len(movie_iterable) == 1:
-            logging.warning(
+            logger.warning(
                 '******** WARNING ****** NEED TO LOAD IN MEMORY SINCE SHAPE OF PAGE IS THE FULL MOVIE')
             movie_iterable = movie_iterable.asarray()
             init_mov = movie_iterable[:init_frames_template]
@@ -801,7 +756,7 @@ def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shif
         init_mov = movie_iterable[slice(0, init_frames_template, 1)]
 
     dims = (len(movie_iterable),) + movie_iterable[0].shape # TODO: Refactor so length is either tracked separately or is last part of tuple
-    logging.debug("dimensions:" + str(dims))
+    logger.debug(f"dimensions: {dims}")
 
     if use_median_as_template:
         template = bin_median(movie_iterable)
@@ -885,9 +840,9 @@ def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shif
                               vmax=350, interpolation='none')
                     plt.pause(.001)
 
-                logging.debug('Relative change in template:' + str(
+                logger.debug('Relative change in template:' + str(
                     np.sum(np.abs(template - template_old)) / np.sum(np.abs(template))))
-                logging.debug('Iteration:' + str(count))
+                logger.debug('Iteration:' + str(count))
 
             if border_to_0 > 0:
                 new_img[:border_to_0, :] = min_mov
@@ -916,7 +871,7 @@ def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shif
 
             if show_movie:
                 cv2.imshow('frame', new_img / 500)
-                logging.info(shift)
+                logger.info(shift)
                 if not np.any(np.remainder(shift, 1) == (0, 0)):
                     cv2.waitKey(int(1. / 500 * 1000))
 
@@ -925,7 +880,7 @@ def motion_correct_online(movie_iterable, add_to_movie, max_shift_w=25, max_shif
         xcorrs.append(xcorr_tmp)
 
     if save_base_name is not None:
-        logging.debug('Flushing memory')
+        logger.debug('Flushing memory')
         big_mov.flush() # type: ignore # mypy cannot prove big_mov is not still None
         del big_mov
         gc.collect()
@@ -1034,9 +989,6 @@ def bin_median(mat, window=10, exclude_nans=True):
     Returns:
         img:
             median image
-
-    Raises:
-        Exception 'Path to template does not exist:'+template
     """
 
     T, d1, d2 = np.shape(mat)
@@ -1066,9 +1018,6 @@ def bin_median_3d(mat, window=10, exclude_nans=True):
     Returns:
         img:
             median image
-
-    Raises:
-        Exception 'Path to template does not exist:'+template
     """
 
     T, d1, d2, d3 = np.shape(mat)
@@ -1087,6 +1036,7 @@ def bin_median_3d(mat, window=10, exclude_nans=True):
 
 def process_movie_parallel(arg_in):
     #todo: todocument
+    logger = logging.getLogger("caiman")
     fname, fr, margins_out, template, max_shift_w, max_shift_h, remove_blanks, apply_smooth, save_hdf5 = arg_in
 
     if template is not None:
@@ -1098,7 +1048,6 @@ def process_movie_parallel(arg_in):
 
     type_input = str(type(fname))
     if 'movie' in type_input:
-        #        logging.info((type(fname)))
         Yr = fname
 
     elif 'ndarray' in type_input:
@@ -1109,40 +1058,30 @@ def process_movie_parallel(arg_in):
         raise Exception('Unknown input type:' + type_input)
 
     if Yr.ndim > 1:
-        #        logging.info('loaded')
         if apply_smooth:
-            #            logging.info('applying smoothing')
             Yr = Yr.bilateral_blur_2D(
                 diameter=10, sigmaColor=10000, sigmaSpace=0)
 
-#        print('Remove BL')
         if margins_out != 0:
             Yr = Yr[:, margins_out:-margins_out, margins_out:-
                     margins_out]  # borders create troubles
-
-#        logging.info('motion correcting')
 
         Yr, shifts, xcorrs, template = Yr.motion_correct(max_shift_w=max_shift_w, max_shift_h=max_shift_h,
                                                          method='opencv', template=template, remove_blanks=remove_blanks)
 
         if ('movie' in type_input) or ('ndarray' in type_input):
-            #            logging.debug('Returning Values')
             return Yr, shifts, xcorrs, template
 
         else:
 
-            #            logging.debug('median computing')
+            #            logger.debug('median computing')
             template = Yr.bin_median()
-#            logging.debug('saving')
             idx_dot = len(fname.split('.')[-1])
             if save_hdf5:
                 Yr.save(fname[:-idx_dot] + 'hdf5')
-#            logging.debug('saving 2')
             np.savez(fname[:-idx_dot] + 'npz', shifts=shifts,
                      xcorrs=xcorrs, template=template)
-#            logging.debug('deleting')
             del Yr
-#            logging.debug('done!')
             return fname[:-idx_dot]
     else:
         return None
@@ -1163,10 +1102,8 @@ def motion_correct_parallel(file_names, fr=10, template=None, margins_out=0,
 
     Returns:
         base file names of the motion corrected files:list[str]
-
-    Raises:
-        Exception
     """
+    logger = logging.getLogger("caiman")
     args_in = []
     for file_idx, f in enumerate(file_names):
         if isinstance(template, list):
@@ -1193,7 +1130,7 @@ def motion_correct_parallel(file_names, fr=10, template=None, margins_out=0,
                 dview.results.clear()
 
         except UnboundLocalError:
-            logging.error('could not close client')
+            logger.error('could not close client')
 
         raise
 
@@ -1276,15 +1213,13 @@ def _upsampled_dft(data, upsampled_region_size,
         upsampled_region_size = [upsampled_region_size, ] * data.ndim
     else:
         if len(upsampled_region_size) != data.ndim:
-            raise ValueError("shape of upsampled region sizes must be equal "
-                             "to input data's number of dimensions.")
+            raise ValueError("shape of upsampled region sizes must be equal to input data's number of dimensions.")
 
     if axis_offsets is None:
         axis_offsets = [0, ] * data.ndim
     else:
         if len(axis_offsets) != data.ndim:
-            raise ValueError("number of axis offsets must be equal to input "
-                             "data's number of dimensions.")
+            raise ValueError("number of axis offsets must be equal to input data's number of dimensions.")
 
     col_kernel = np.exp(
         (-1j * 2 * np.pi / (data.shape[1] * upsample_factor)) *
@@ -1425,13 +1360,11 @@ def register_translation_3d(src_image, target_image, upsample_factor = 1,
 
     # images must be the same shape
     if src_image.shape != target_image.shape:
-        raise ValueError("Error: images must really be same size for "
-                         "register_translation_3d")
+        raise ValueError("Error: images must really be same size for register_translation_3d")
 
     # only 3D data makes sense right now
     if src_image.ndim != 3 and upsample_factor > 1:
-        raise NotImplementedError("Error: register_translation_3d only supports "
-                                  "subpixel registration for 3D images")
+        raise NotImplementedError("Error: register_translation_3d only supports subpixel registration for 3D images")
 
     # assume complex data is already in Fourier space
     if space.lower() == 'fourier':
@@ -1446,13 +1379,11 @@ def register_translation_3d(src_image, target_image, upsample_factor = 1,
         src_freq = np.fft.fftn(src_image_cpx)
         target_freq = np.fft.fftn(target_image_cpx)
     else:
-        raise ValueError("Error: register_translation_3d only knows the \"real\" "
-                         "and \"fourier\" values for the ``space`` argument.")
+        raise ValueError('Error: register_translation_3d only knows the "real" and "fourier" values for the ``space`` argument.')
 
     shape = src_freq.shape
     image_product = src_freq * target_freq.conj()
     cross_correlation = np.fft.ifftn(image_product)
-#    cross_correlation = ifftn(image_product) # TODO CHECK why this line is different
     new_cross_corr = np.abs(cross_correlation)
 
     CCmax = cross_correlation.max()
@@ -1460,7 +1391,7 @@ def register_translation_3d(src_image, target_image, upsample_factor = 1,
     del cross_correlation
 
     if (shifts_lb is not None) or (shifts_ub is not None):
-
+        # TODO this will fail if only one is not none - should this be an "and"?
         if (shifts_lb[0] < 0) and (shifts_ub[0] >= 0):
             new_cross_corr[shifts_ub[0]:shifts_lb[0], :, :] = 0
         else:
@@ -1587,8 +1518,8 @@ def register_translation(src_image, target_image, upsample_factor=1,
             will be FFT'd to compute the correlation, while "fourier" data will
             bypass FFT of input data.  Case insensitive.
 
-        use_cuda : bool, optional
-            Use skcuda.fft (if available). Default: False
+        use_cuda : bool (DEPRECATED)
+            cuda is no longer supported for motion correction; this kwarg will be removed in a future version of Caiman
 
     Returns:
         shifts : ndarray
@@ -1620,22 +1551,11 @@ def register_translation(src_image, target_image, upsample_factor=1,
     """
     # images must be the same shape
     if src_image.shape != target_image.shape:
-        raise ValueError("Error: images must really be same size for "
-                         "register_translation")
+        raise ValueError("Error: images must really be same size for register_translation")
 
     # only 2D data makes sense right now
     if src_image.ndim != 2 and upsample_factor > 1:
-        raise NotImplementedError("Error: register_translation only supports "
-                                  "subpixel registration for 2D images")
-
-    if HAS_CUDA and use_cuda:
-        from skcuda.fft import Plan
-        from skcuda.fft import fft as cudafft
-        from skcuda.fft import ifft as cudaifft
-        try:
-            cudactx # type: ignore
-        except NameError:
-            init_cuda_process()
+        raise NotImplementedError("Error: register_translation only supports subpixel registration for 2D images")
 
     # assume complex data is already in Fourier space
     if space.lower() == 'fourier':
@@ -1643,82 +1563,29 @@ def register_translation(src_image, target_image, upsample_factor=1,
         target_freq = target_image
     # real data needs to be fft'd.
     elif space.lower() == 'real':
-        if HAS_CUDA and use_cuda:
-            # src_image_cpx = np.array(src_image, dtype=np.complex128, copy=False)
-            # target_image_cpx = np.array(target_image, dtype=np.complex128, copy=False)
-
-            image_gpu = gpuarray.to_gpu(np.stack((src_image, target_image)).astype(np.complex128))
-            freq_gpu = gpuarray.empty((2, src_image.shape[0], src_image.shape[1]), dtype=np.complex128)
-            # src_image_gpu = gpuarray.to_gpu(src_image_cpx)
-            # src_freq_gpu = gpuarray.empty(src_image_cpx.shape, np.complex128)
-
-            # target_image_gpu = gpuarray.to_gpu(target_image_cpx)
-            # target_freq_gpu = gpuarray.empty(target_image_cpx.shape, np.complex128)
-
-            plan = Plan(src_image.shape, np.complex128, np.complex128, batch=2)
-            # cudafft(src_image_gpu, src_freq_gpu, plan, scale=True)
-            # cudafft(target_image_gpu, target_freq_gpu, plan, scale=True)
-            cudafft(image_gpu, freq_gpu, plan, scale=True)
-            # src_freq = src_freq_gpu.get()
-            # target_freq = target_freq_gpu.get()
-            freq = freq_gpu.get()
-            src_freq = freq[0, :, :]
-            target_freq = freq[1, :, :]
-
-            # del(src_image_gpu)
-            # del(src_freq_gpu)
-            # del(target_image_gpu)
-            # del(target_freq_gpu)
-            del(image_gpu)
-            del(freq_gpu)
-        elif opencv:
-            src_freq_1 = cv2.dft(
-                src_image, flags=cv2.DFT_COMPLEX_OUTPUT + cv2.DFT_SCALE)
-            src_freq = src_freq_1[:, :, 0] + 1j * src_freq_1[:, :, 1]
-            src_freq = np.array(src_freq, dtype=np.complex128, copy=False)
-            target_freq_1 = cv2.dft(
-                target_image, flags=cv2.DFT_COMPLEX_OUTPUT + cv2.DFT_SCALE)
-            target_freq = target_freq_1[:, :, 0] + 1j * target_freq_1[:, :, 1]
-            target_freq = np.array(
-                target_freq, dtype=np.complex128, copy=False)
-        else:
-            src_image_cpx = np.array(
-                src_image, dtype=np.complex128, copy=False)
-            target_image_cpx = np.array(
-                target_image, dtype=np.complex128, copy=False)
-            src_freq = np.fft.fftn(src_image_cpx)
-            target_freq = np.fft.fftn(target_image_cpx)
-
+        src_freq_1 = cv2.dft(
+            src_image, flags=cv2.DFT_COMPLEX_OUTPUT + cv2.DFT_SCALE)
+        src_freq = src_freq_1[:, :, 0] + 1j * src_freq_1[:, :, 1]
+        src_freq = np.array(src_freq, dtype=np.complex128, copy=False)
+        target_freq_1 = cv2.dft(
+            target_image, flags=cv2.DFT_COMPLEX_OUTPUT + cv2.DFT_SCALE)
+        target_freq = target_freq_1[:, :, 0] + 1j * target_freq_1[:, :, 1]
+        target_freq = np.array(
+            target_freq, dtype=np.complex128, copy=False)
     else:
-        raise ValueError("Error: register_translation only knows the \"real\" "
-                         "and \"fourier\" values for the ``space`` argument.")
+        raise ValueError('Error: register_translation only knows the "real" and "fourier" values for the ``space`` argument.')
 
     # Whole-pixel shift - Compute cross-correlation by an IFFT
     shape = src_freq.shape
     image_product = src_freq * target_freq.conj()
-    if HAS_CUDA and use_cuda:
-        image_product_gpu = gpuarray.to_gpu(image_product)
-        cross_correlation_gpu = gpuarray.empty(
-            image_product.shape, np.complex128)
-        iplan = Plan(image_product.shape, np.complex128, np.complex128)
-        cudaifft(image_product_gpu, cross_correlation_gpu, iplan, scale=True)
-        cross_correlation = cross_correlation_gpu.get()
-    elif opencv:
-
-        image_product_cv = np.dstack(
-            [np.real(image_product), np.imag(image_product)])
-        cross_correlation = cv2.dft(
-            image_product_cv, flags=cv2.DFT_INVERSE + cv2.DFT_SCALE)
-        cross_correlation = cross_correlation[:,
-                                              :, 0] + 1j * cross_correlation[:, :, 1]
-    else:
-        cross_correlation = cv2.idft(image_product)
+    image_product_cv = np.dstack([np.real(image_product), np.imag(image_product)])
+    cross_correlation = cv2.dft(image_product_cv, flags=cv2.DFT_INVERSE + cv2.DFT_SCALE)
+    cross_correlation = cross_correlation[:, :, 0] + 1j * cross_correlation[:, :, 1]
 
     # Locate maximum
     new_cross_corr = np.abs(cross_correlation)
 
     if (shifts_lb is not None) or (shifts_ub is not None):
-
         if (shifts_lb[0] < 0) and (shifts_ub[0] >= 0):
             new_cross_corr[shifts_ub[0]:shifts_lb[0], :] = 0
         else:
@@ -1731,9 +1598,7 @@ def register_translation(src_image, target_image, upsample_factor=1,
             new_cross_corr[:, :shifts_lb[1]] = 0
             new_cross_corr[:, shifts_ub[1]:] = 0
     else:
-
         new_cross_corr[max_shifts[0]:-max_shifts[0], :] = 0
-
         new_cross_corr[:, max_shifts[1]:-max_shifts[1]] = 0
 
     maxima = np.unravel_index(np.argmax(new_cross_corr),
@@ -1745,7 +1610,6 @@ def register_translation(src_image, target_image, upsample_factor=1,
     shifts[shifts > midpoints] -= np.array(shape)[shifts > midpoints]
 
     if upsample_factor == 1:
-
         src_amp = np.sum(np.abs(src_freq) ** 2) / src_freq.size
         target_amp = np.sum(np.abs(target_freq) ** 2) / target_freq.size
         CCmax = cross_correlation.max()
@@ -1913,71 +1777,150 @@ def apply_shifts_dft(src_freq, shifts, diffphase, is_freq=True, border_nan=True)
                     new_img[:, :, :max_d] = new_img[:, :, max_d, np.newaxis]
                 if min_d < 0:
                     new_img[:, :, min_d:] = new_img[:, :, min_d-1, np.newaxis]
+        else:
+            logging.warning(f'Unknown value of border_nan ({border_nan}); treating as False')
 
     return new_img
 
-def sliding_window(image, overlaps, strides):
+def get_patch_edges(dims: tuple[int, ...], overlaps: tuple[int, ...], strides: tuple[int, ...],
+                    ) -> tuple[list[int], ...]:
+    """For each dimension, return a vector of pixels along that dimension where patches start"""
+    windowSizes = np.add(overlaps, strides)
+    return tuple(
+        list(range(0, dim - windowSize, stride)) + [dim - windowSize]
+        for dim, windowSize, stride in zip(dims, windowSizes, strides)
+    )
+
+
+def get_patch_centers(dims: tuple[int, ...], overlaps: tuple[int, ...], strides: tuple[int, ...],
+                      shifts_opencv=False, upsample_factor_grid=1) -> tuple[list[float], ...]:
+    """
+    For each dimension, return a vector of patch center locations for pw_rigid correction
+    shifts_opencv just overrides upsample_factor_grid (forces it to 1), this is an easy way to
+    get the correct values by just providing the motion correction parameters, but
+    by default no extra upsampling is done.
+    """
+    if not shifts_opencv and upsample_factor_grid != 1:
+        # account for upsampling step
+        strides = tuple(np.round(np.divide(strides, upsample_factor_grid)).astype(int))
+    
+    patch_edges = get_patch_edges(dims, overlaps, strides)
+    windowSizes = np.add(overlaps, strides)
+    return tuple([edge + (sz - 1) / 2 for edge in edges] for edges, sz in zip(patch_edges, windowSizes))
+
+
+def sliding_window_dims(dims: tuple[int, ...], overlaps: tuple[int, ...], strides: tuple[int, ...]):
+    """ computes dimensions for a sliding window with given image dims, overlaps, and strides
+
+    Args: 
+        dims: tuple
+            the dimensions of the image
+
+        overlaps: tuple
+            overlap of patches in each dimension, except that the last patch will be all the way
+            at the bottom/right regardless of overlap
+
+        strides: tuple
+            stride in each dimension, except that the last patch will be all the way
+            at the bottom/right regardless of stride
+
+     Returns:
+         iterator containing 3 items:
+              inds: (x, y, ...) coordinates in the patch grid
+              corner: (x, y, ...) location of corner of the patch in the original matrix
+              size: (x, y, ...) size of patch in pixels
+    """
+    windowSizes = np.add(overlaps, strides)
+    edge_ranges = get_patch_edges(dims, overlaps, strides)
+
+    for patch in itertools.product(*[enumerate(r) for r in edge_ranges]):
+        inds, corners = zip(*patch)
+        yield (tuple(inds), tuple(corners), windowSizes)
+
+
+def sliding_window(image: np.ndarray, overlaps: tuple[int, int], strides: tuple[int, int]):
     """ efficiently and lazily slides a window across the image
 
     Args: 
-        img:ndarray 2D
-            image that needs to be slices
+        img: ndarray 2D
+            image that needs to be sliced
 
-        windowSize: tuple
-            dimension of the patch
+        overlaps: tuple
+            overlap of patches in each dimension, except that the last patch will be all the way
+            at the bottom/right regardless of overlap
 
         strides: tuple
-            stride in each dimension
+            stride in each dimension, except that the last patch will be all the way
+            at the bottom/right regardless of stride
 
      Returns:
          iterator containing five items
               dim_1, dim_2 coordinates in the patch grid
               x, y: bottom border of the patch in the original matrix
-
               patch: the patch
-     """
-    windowSize = np.add(overlaps, strides)
-    range_1 = list(range(
-        0, image.shape[0] - windowSize[0], strides[0])) + [image.shape[0] - windowSize[0]]
-    range_2 = list(range(
-        0, image.shape[1] - windowSize[1], strides[1])) + [image.shape[1] - windowSize[1]]
-    for dim_1, x in enumerate(range_1):
-        for dim_2, y in enumerate(range_2):
-            # yield the current window
-            yield (dim_1, dim_2, x, y, image[x:x + windowSize[0], y:y + windowSize[1]])
+    """
+    if image.ndim != 2:
+        raise ValueError('Input to sliding_window must be 2D')
 
-def sliding_window_3d(image, overlaps, strides):
+    for inds, corner, size in sliding_window_dims(image.shape, overlaps, strides):
+        patch = image[corner[0]:corner[0] + size[0], corner[1]:corner[1] + size[1]]
+        yield inds + corner + (patch,)
+
+
+def sliding_window_3d(image: np.ndarray, overlaps: tuple[int, int, int], strides: tuple[int, int, int]):
     """ efficiently and lazily slides a window across the image
 
     Args: 
-        img:ndarray 3D
-            image that needs to be slices
+        img: ndarray 3D
+            image that needs to be sliced
 
-        windowSize: tuple
-            dimension of the patch
+        overlaps: tuple
+            overlap of patches in each dimension, except that the last patch will be all the way
+            at the bottom/right regardless of overlap 
 
         strides: tuple
-            stride in each dimension
+            stride in each dimension, except that the last patch will be all the way
+            at the bottom/right regardless of stride
 
      Returns:
          iterator containing seven items
               dim_1, dim_2, dim_3 coordinates in the patch grid
               x, y, z: bottom border of the patch in the original matrix
-
               patch: the patch
      """
-    windowSize = np.add(overlaps, strides)
-    range_1 = list(range(
-        0, image.shape[0] - windowSize[0], strides[0])) + [image.shape[0] - windowSize[0]]
-    range_2 = list(range(
-        0, image.shape[1] - windowSize[1], strides[1])) + [image.shape[1] - windowSize[1]]
-    range_3 = list(range(
-        0, image.shape[2] - windowSize[2], strides[2])) + [image.shape[2] - windowSize[2]]
-    for dim_1, x in enumerate(range_1):
-        for dim_2, y in enumerate(range_2):
-            for dim_3, z in enumerate(range_3):
-                # yield the current window
-                yield (dim_1, dim_2, dim_3, x, y, z, image[x:x + windowSize[0], y:y + windowSize[1], z:z + windowSize[2]])
+    if image.ndim != 3:
+        raise ValueError('Input to sliding_window_3d must be 3D')
+
+    for inds, corner, size in sliding_window_dims(image.shape, overlaps, strides):
+        patch = image[corner[0]:corner[0] + size[0],
+                      corner[1]:corner[1] + size[1],
+                      corner[2]:corner[2] + size[2]]
+        yield inds + corner + (patch,)
+
+
+def interpolate_shifts(shifts, coords_orig: tuple, coords_new: tuple) -> np.ndarray:
+    """
+    Interpolate piecewise shifts onto new coordinates. Pixels outside the original coordinates will be filled with edge values.
+    
+    Args:
+        shifts: ndarray or other array-like
+            shifts to interpolate; must have the same number of elements as the outer product of coords_orig
+
+        coords_orig: tuple of float vectors
+            patch center coordinates along each dimension (e.g. outputs of get_patch_centers)
+        
+        coords_new: tuple of float vectors
+            coordinates along each dimension at which to output interpolated shifts
+    
+    Returns:
+        ndarray of interpolated shifts, of shape tuple(len(coords) for coords in coords_new)
+    """
+    # clip new coordinates to avoid extrapolation
+    coords_new_clipped = [np.clip(coord, min(coord_orig), max(coord_orig)) for coord, coord_orig in zip(coords_new, coords_orig)]
+    coords_new_stacked = np.stack(np.meshgrid(*coords_new_clipped, indexing='ij'), axis=-1)
+    shifts_grid = np.reshape(shifts, tuple(len(coord) for coord in coords_orig))
+    return scipy.interpolate.interpn(coords_orig, shifts_grid, coords_new_stacked, method="cubic")
+
 
 def iqr(a):
     return np.percentile(a, 75) - np.percentile(a, 25)
@@ -2068,7 +2011,7 @@ def high_pass_filter_space(img_orig, gSig_filt=None, freq=None, order=None):
 
 def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=None, newstrides=None, upsample_factor_grid=4,
                      upsample_factor_fft=10, show_movie=False, max_deviation_rigid=2, add_to_movie=0, shifts_opencv=False, gSig_filt=None,
-                     use_cuda=False, border_nan=True):
+                     use_cuda=False, border_nan=True, shifts_interpolate=False):
     """ perform piecewise rigid motion correction iteration, by
         1) dividing the FOV in patches
         2) motion correcting each patch separately
@@ -2091,11 +2034,11 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
         max_shifts: tuple
             max shifts in x and y
 
-        newstrides:tuple
-            strides between patches along each dimension when upsampling the vector fields
-
         newoverlaps:tuple
             amount of pixel overlapping between patches along each dimension when upsampling the vector fields
+
+        newstrides:tuple
+            strides between patches along each dimension when upsampling the vector fields
 
         upsample_factor_grid: int
             if newshapes or newstrides are not specified this is inferred upsampling by a constant factor the cvector field
@@ -2103,21 +2046,29 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
         upsample_factor_fft: int
             resolution of fractional shifts
 
-        show_movie: boolean whether to visualize the original and corrected frame during motion correction
+        show_movie: bool
+            whether to visualize the original and corrected frame during motion correction
 
         max_deviation_rigid: int
             maximum deviation in shifts of each patch from the rigid shift (should not be large)
 
-        add_to_movie: if movie is too negative the correction might have some issues. In this case it is good to add values so that it is non negative most of the times
+        add_to_movie: int
+            if movie is too negative the correction might have some issues. In this case it is good to add values so that it is non negative most of the times
 
-        filt_sig_size: tuple
+        shifts_opencv: bool
+            FIXME: (UNDOCUMENTED)
+
+        gSig_filt: tuple
             standard deviation and size of gaussian filter to center filter data in case of one photon imaging data
 
-        use_cuda : bool, optional
-            Use skcuda.fft (if available). Default: False
+        use_cuda: bool (DEPRECATED)
+               cuda is no longer supported for motion correction; this kwarg will be removed in a future version of Caiman
 
         border_nan : bool or string, optional
             specifies how to deal with borders. (True, False, 'copy', 'min')
+        
+        shifts_interpolate: bool
+            use patch locations to interpolate shifts rather than just upscaling to size of image. Default: False
 
     Returns:
         (new_img, total_shifts, start_step, xy_grid)
@@ -2125,12 +2076,12 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
 
 
     """
-    logging.debug("Starting tile and correct")
+    logger = logging.getLogger("caiman")
+    logger.debug("Starting tile and correct")
     img = img.astype(np.float64).copy()
     template = template.astype(np.float64).copy()
 
     if gSig_filt is not None:
-
         img_orig = img.copy()
         img = high_pass_filter_space(img_orig, gSig_filt)
 
@@ -2142,7 +2093,6 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
         img, template, upsample_factor=upsample_factor_fft, max_shifts=max_shifts, use_cuda=use_cuda)
 
     if max_deviation_rigid == 0:
-
         if shifts_opencv:
             if gSig_filt is not None:
                 img = img_orig
@@ -2151,10 +2101,9 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
                 img, (-rigid_shts[0], -rigid_shts[1]), border_nan=border_nan)
 
         else:
-
             if gSig_filt is not None:
                 raise Exception(
-                    'The use of FFT and filtering options have not been tested. Set opencv=True')
+                    'The use of FFT and filtering options have not been tested. Set shifts_opencv=True or do not provide gSig_filt')
 
             new_img = apply_shifts_dft(
                 sfr_freq, (-rigid_shts[0], -rigid_shts[1]), diffphase, border_nan=border_nan)
@@ -2162,30 +2111,29 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
         return new_img - add_to_movie, (-rigid_shts[0], -rigid_shts[1]), None, None
     else:
         # extract patches
-        logging.info("Extracting patches")
-        templates = [
-            it[-1] for it in sliding_window(template, overlaps=overlaps, strides=strides)]
-        xy_grid = [(it[0], it[1]) for it in sliding_window(
-            template, overlaps=overlaps, strides=strides)]
-        num_tiles = np.prod(np.add(xy_grid[-1], 1))
-        imgs = [it[-1]
-                for it in sliding_window(img, overlaps=overlaps, strides=strides)]
+        logger.debug("Extracting patches")
+        xy_grid: list[tuple[int, int]] = []
+        templates: list[np.ndarray] = []
+
+        for (xind, yind, _, _, patch) in sliding_window(template, overlaps=overlaps, strides=strides):
+            xy_grid.append((xind, yind))
+            templates.append(patch)
+
+        imgs = [it[-1] for it in sliding_window(img, overlaps=overlaps, strides=strides)]
         dim_grid = tuple(np.add(xy_grid[-1], 1))
+        num_tiles = len(xy_grid)
 
         if max_deviation_rigid is not None:
-
             lb_shifts = np.ceil(np.subtract(
                 rigid_shts, max_deviation_rigid)).astype(int)
             ub_shifts = np.floor(
                 np.add(rigid_shts, max_deviation_rigid)).astype(int)
-
         else:
-
             lb_shifts = None
             ub_shifts = None
 
         # extract shifts for each patch
-        logging.info("extracting shifts for each patch")
+        logger.debug("Extracting shifts for each patch")
         shfts_et_all = [register_translation(
             a, b, c, shifts_lb=lb_shifts, shifts_ub=ub_shifts, max_shifts=max_shifts, use_cuda=use_cuda) for a, b, c in zip(
             imgs, templates, [upsample_factor_fft] * num_tiles)]
@@ -2201,12 +2149,11 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
                 img = img_orig
 
             dims = img.shape
-            x_grid, y_grid = np.meshgrid(np.arange(0., dims[1]).astype(
-                np.float32), np.arange(0., dims[0]).astype(np.float32))
-            m_reg = cv2.remap(img, cv2.resize(shift_img_y.astype(np.float32), dims[::-1]) + x_grid,
-                              cv2.resize(shift_img_x.astype(np.float32), dims[::-1]) + y_grid,
-                              cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                             # borderValue=add_to_movie)
+            patch_centers = get_patch_centers(dims, strides=strides, overlaps=overlaps)
+            # shift_img_x and shift_img_y are switched intentionally
+            m_reg = apply_pw_shifts_remap_2d(img, shifts_y=shift_img_x, shifts_x=shift_img_y,
+                                             patch_centers=patch_centers, border_nan=border_nan,
+                                             shifts_interpolate=shifts_interpolate)
             total_shifts = [
                     (-x, -y) for x, y in zip(shift_img_x.reshape(num_tiles), shift_img_y.reshape(num_tiles))]
             return m_reg - add_to_movie, total_shifts, None, None
@@ -2220,25 +2167,32 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
 
         newshapes = np.add(newstrides, newoverlaps)
 
-        imgs = [it[-1]
-                for it in sliding_window(img, overlaps=newoverlaps, strides=newstrides)]
+        xy_grid: list[tuple[int, int]] = []
+        start_step: list[tuple[int, int]] = []
+        imgs: list[np.ndarray] = []
 
-        xy_grid = [(it[0], it[1]) for it in sliding_window(
-            img, overlaps=newoverlaps, strides=newstrides)]
-
-        start_step = [(it[2], it[3]) for it in sliding_window(
-            img, overlaps=newoverlaps, strides=newstrides)]
+        for (xind, yind, xstart, ystart, patch) in sliding_window(img, overlaps=newoverlaps, strides=newstrides):
+            xy_grid.append((xind, yind))
+            start_step.append((xstart, ystart))
+            imgs.append(patch)
 
         dim_new_grid = tuple(np.add(xy_grid[-1], 1))
+        num_tiles = len(xy_grid)
 
-        shift_img_x = cv2.resize(
-            shift_img_x, dim_new_grid[::-1], interpolation=cv2.INTER_CUBIC)
-        shift_img_y = cv2.resize(
-            shift_img_y, dim_new_grid[::-1], interpolation=cv2.INTER_CUBIC)
-        diffs_phase_grid_us = cv2.resize(
-            diffs_phase_grid, dim_new_grid[::-1], interpolation=cv2.INTER_CUBIC)
+        if shifts_interpolate:
+            patch_centers_orig = get_patch_centers(img.shape, strides=strides, overlaps=overlaps)
+            patch_centers_new = get_patch_centers(img.shape, strides=newstrides, overlaps=newoverlaps)
+            shift_img_x = interpolate_shifts(shift_img_x, patch_centers_orig, patch_centers_new)
+            shift_img_y = interpolate_shifts(shift_img_y, patch_centers_orig, patch_centers_new)
+            diffs_phase_grid_us = interpolate_shifts(diffs_phase_grid, patch_centers_orig, patch_centers_new)
+        else:
+            shift_img_x = cv2.resize(
+                shift_img_x, dim_new_grid[::-1], interpolation=cv2.INTER_CUBIC)
+            shift_img_y = cv2.resize(
+                shift_img_y, dim_new_grid[::-1], interpolation=cv2.INTER_CUBIC)
+            diffs_phase_grid_us = cv2.resize(
+                diffs_phase_grid, dim_new_grid[::-1], interpolation=cv2.INTER_CUBIC)
 
-        num_tiles = np.prod(dim_new_grid)
 
         max_shear = np.percentile(
             [np.max(np.abs(np.diff(ssshh, axis=xxsss))) for ssshh, xxsss in itertools.product(
@@ -2251,7 +2205,7 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
 
         if gSig_filt is not None:
             raise Exception(
-                'The use of FFT and filtering options have not been tested. Set opencv=True')
+                'The use of FFT and filtering options have not been tested. Set shifts_opencv=True')
 
         imgs = [apply_shifts_dft(im, (
             sh[0], sh[1]), dffphs, is_freq=False, border_nan=border_nan) for im, sh, dffphs in zip(
@@ -2315,7 +2269,7 @@ def tile_and_correct(img, template, strides, overlaps, max_shifts, newoverlaps=N
 
 def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, overlaps:tuple, max_shifts:tuple, newoverlaps:Optional[tuple]=None, newstrides:Optional[tuple]=None, upsample_factor_grid:int=4,
                      upsample_factor_fft:int=10, show_movie:bool=False, max_deviation_rigid:int=2, add_to_movie:int=0, shifts_opencv:bool=True, gSig_filt=None,
-                     use_cuda:bool=False, border_nan:bool=True):
+                     use_cuda:bool=False, border_nan:bool=True, shifts_interpolate:bool=False):
     """ perform piecewise rigid motion correction iteration, by
         1) dividing the FOV in patches
         2) motion correcting each patch separately
@@ -2323,7 +2277,7 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
         4) stiching back together the corrected subpatches
 
     Args:
-        img: ndaarray 3D
+        img: ndarray 3D
             image to correct
 
         template: ndarray
@@ -2350,21 +2304,28 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
         upsample_factor_fft: int
             resolution of fractional shifts
 
-        show_movie: boolean whether to visualize the original and corrected frame during motion correction
+        show_movie: bool
+            whether to visualize the original and corrected frame during motion correction
 
         max_deviation_rigid: int
             maximum deviation in shifts of each patch from the rigid shift (should not be large)
 
         add_to_movie: if movie is too negative the correction might have some issues. In this case it is good to add values so that it is non negative most of the times
 
-        filt_sig_size: tuple
+        shifts_opencv: bool
+            FIXME: (UNDOCUMENTED)
+
+        gSig_filt: tuple
             standard deviation and size of gaussian filter to center filter data in case of one photon imaging data
 
-        use_cuda : bool, optional
-            Use skcuda.fft (if available). Default: False
+        use_cuda : bool (DEPRECATED)
+            cuda is no longer supported for motion correction; this kwarg will be removed in a future version of Caiman
 
         border_nan : bool or string, optional
             specifies how to deal with borders. (True, False, 'copy', 'min')
+        
+        shifts_interpolate: bool
+            use patch locations to interpolate shifts rather than just upscaling to size of image. Default: False
 
     Returns:
         (new_img, total_shifts, start_step, xyz_grid)
@@ -2373,11 +2334,11 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
 
     """
 
+    # TODO The clarity of this function is poor; it'd be good to refactor it towards being easier to read/understand
     img = img.astype(np.float64).copy()
     template = template.astype(np.float64).copy()
 
     if gSig_filt is not None:
-
         img_orig = img.copy()
         img = high_pass_filter_space(img_orig, gSig_filt)
 
@@ -2389,14 +2350,9 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
         img, template, upsample_factor=upsample_factor_fft, max_shifts=max_shifts)
 
     if max_deviation_rigid == 0: # if rigid shifts only
-
-#        if shifts_opencv:
-            # NOTE: opencv does not support 3D operations - skimage is used instead
- #       else:
-
         if gSig_filt is not None:
             raise Exception(
-                'The use of FFT and filtering options have not been tested. Set opencv=True')
+                'The use of FFT and filtering options has not been tested. Do not use gSig_filt with rigid shifts only')
 
         new_img = apply_shifts_dft( # TODO: check
             sfr_freq, (-rigid_shts[0], -rigid_shts[1], -rigid_shts[2]), diffphase, border_nan=border_nan)
@@ -2404,24 +2360,23 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
         return new_img - add_to_movie, (-rigid_shts[0], -rigid_shts[1], -rigid_shts[2]), None, None
     else:
         # extract patches
-        templates = [
-            it[-1] for it in sliding_window_3d(template, overlaps=overlaps, strides=strides)]
-        xyz_grid = [(it[0], it[1], it[2]) for it in sliding_window_3d(
-            template, overlaps=overlaps, strides=strides)]
-        num_tiles = np.prod(np.add(xyz_grid[-1], 1))
-        imgs = [it[-1]
-                for it in sliding_window_3d(img, overlaps=overlaps, strides=strides)]
+        xyz_grid: list[tuple[int, int, int]] = []
+        templates: list[np.ndarray] = []
+
+        for (xind, yind, zind, _, _, _, patch) in sliding_window_3d(template, overlaps=overlaps, strides=strides):
+            xyz_grid.append((xind, yind, zind))
+            templates.append(patch)
+
+        imgs = [it[-1] for it in sliding_window_3d(img, overlaps=overlaps, strides=strides)]
         dim_grid = tuple(np.add(xyz_grid[-1], 1))
+        num_tiles = len(xyz_grid)
 
         if max_deviation_rigid is not None:
-
             lb_shifts = np.ceil(np.subtract(
                 rigid_shts, max_deviation_rigid)).astype(int)
             ub_shifts = np.floor(
                 np.add(rigid_shts, max_deviation_rigid)).astype(int)
-
         else:
-
             lb_shifts = None
             ub_shifts = None
 
@@ -2441,37 +2396,19 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
         if shifts_opencv:
             if gSig_filt is not None:
                 img = img_orig
+            
+            patch_centers = get_patch_centers(img.shape, strides=strides, overlaps=overlaps)
+            # shift_img_x and shift_img_y are switched intentionally
+            m_reg = apply_pw_shifts_remap_3d(
+                img, shifts_y=shift_img_x, shifts_x=shift_img_y, shifts_z=shift_img_z,
+                patch_centers=patch_centers, border_nan=border_nan,
+                shifts_interpolate=shifts_interpolate)
 
-            dims = img.shape
-            x_grid, y_grid, z_grid = np.meshgrid(np.arange(0., dims[1]).astype(
-                np.float32), np.arange(0., dims[0]).astype(np.float32),
-                np.arange(0., dims[2]).astype(np.float32))
-            if border_nan is not False:
-                if border_nan is True:
-                    m_reg = warp_sk(img, np.stack((resize_sk(shift_img_x.astype(np.float32), dims) + y_grid,
-                                    resize_sk(shift_img_y.astype(np.float32), dims) + x_grid,
-                                    resize_sk(shift_img_z.astype(np.float32), dims) + z_grid), axis=0),
-                                    order=3, mode='constant', cval=np.nan)
-                elif border_nan == 'min':
-                    m_reg = warp_sk(img, np.stack((resize_sk(shift_img_x.astype(np.float32), dims) + y_grid,
-                                    resize_sk(shift_img_y.astype(np.float32), dims) + x_grid,
-                                    resize_sk(shift_img_z.astype(np.float32), dims) + z_grid), axis=0),
-                                    order=3, mode='constant', cval=np.min(img))
-                elif border_nan == 'copy':
-                    m_reg = warp_sk(img, np.stack((resize_sk(shift_img_x.astype(np.float32), dims) + y_grid,
-                                    resize_sk(shift_img_y.astype(np.float32), dims) + x_grid,
-                                    resize_sk(shift_img_z.astype(np.float32), dims) + z_grid), axis=0),
-                                    order=3, mode='edge')
-            else:
-                m_reg = warp_sk(img, np.stack((resize_sk(shift_img_x.astype(np.float32), dims) + y_grid,
-                                resize_sk(shift_img_y.astype(np.float32), dims) + x_grid,
-                                resize_sk(shift_img_z.astype(np.float32), dims) + z_grid), axis=0),
-                                order=3, mode='constant')
             total_shifts = [
                     (-x, -y, -z) for x, y, z in zip(shift_img_x.reshape(num_tiles), shift_img_y.reshape(num_tiles), shift_img_z.reshape(num_tiles))]
             return m_reg - add_to_movie, total_shifts, None, None
 
-        # create automatically upsample parameters if not passed
+        # create automatically upsampled parameters if not passed
         if newoverlaps is None:
             newoverlaps = overlaps
         if newstrides is None:
@@ -2480,29 +2417,37 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
 
         newshapes = np.add(newstrides, newoverlaps)
 
-        imgs = [it[-1]
-                for it in sliding_window_3d(img, overlaps=newoverlaps, strides=newstrides)]
+        xyz_grid: list[tuple[int, int, int]] = []
+        start_step: list[tuple[int, int, int]] = []
+        imgs: list[np.ndarray] = []
 
-        xyz_grid = [(it[0], it[1], it[2]) for it in sliding_window_3d(
-            img, overlaps=newoverlaps, strides=newstrides)]
-
-        start_step = [(it[3], it[4], it[5]) for it in sliding_window_3d(
-            img, overlaps=newoverlaps, strides=newstrides)]
+        for (xind, yind, zind, xstart, ystart, zstart, patch) in sliding_window_3d(
+            img, overlaps=newoverlaps, strides=newstrides):
+            xyz_grid.append((xind, yind, zind))
+            start_step.append((xstart, ystart, zstart))
+            imgs.append(patch)
 
         dim_new_grid = tuple(np.add(xyz_grid[-1], 1))
+        num_tiles = len(xyz_grid)
 
-        shift_img_x = resize_sk(
-            shift_img_x, dim_new_grid[::-1], order=3)
-        shift_img_y = resize_sk(
-            shift_img_y, dim_new_grid[::-1], order=3)
-        shift_img_z = resize_sk(
-            shift_img_z, dim_new_grid[::-1], order=3)
-        diffs_phase_grid_us = resize_sk(
-            diffs_phase_grid, dim_new_grid[::-1], order=3)
+        if shifts_interpolate:
+            patch_centers_orig = get_patch_centers(img.shape, strides=strides, overlaps=overlaps)
+            patch_centers_new = get_patch_centers(img.shape, strides=newstrides, overlaps=newoverlaps)
+            shift_img_x = interpolate_shifts(shift_img_x, patch_centers_orig, patch_centers_new)
+            shift_img_y = interpolate_shifts(shift_img_y, patch_centers_orig, patch_centers_new)
+            shift_img_z = interpolate_shifts(shift_img_z, patch_centers_orig, patch_centers_new)
+            diffs_phase_grid_us = interpolate_shifts(diffs_phase_grid, patch_centers_orig, patch_centers_new)
+        else:
+            shift_img_x = resize_sk(
+                shift_img_x, dim_new_grid[::-1], order=3)
+            shift_img_y = resize_sk(
+                shift_img_y, dim_new_grid[::-1], order=3)
+            shift_img_z = resize_sk(
+                shift_img_z, dim_new_grid[::-1], order=3)
+            diffs_phase_grid_us = resize_sk(
+                diffs_phase_grid, dim_new_grid[::-1], order=3)
 
-        num_tiles = np.prod(dim_new_grid)
-
-        # what dimension shear should be looked at? shearing for 3d point scanning happens in y and z but no for plane-scanning
+        # what dimension shear should be looked at? shearing for 3d point scanning happens in y and z but not for plane-scanning
         max_shear = np.percentile(
             [np.max(np.abs(np.diff(ssshh, axis=xxsss))) for ssshh, xxsss in itertools.product(
                 [shift_img_x, shift_img_y], [0, 1])], 75)
@@ -2514,7 +2459,7 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
 
         if gSig_filt is not None:
             raise Exception(
-                'The use of FFT and filtering options have not been tested. Set opencv=True')
+                'The use of FFT and filtering options have not been tested. Do not use gSig_filt in this mode without shifts_opencv')
 
         imgs = [apply_shifts_dft(im, (
             sh[0], sh[1], sh[2]), dffphs, is_freq=False, border_nan=border_nan) for im, sh, dffphs in zip(
@@ -2572,7 +2517,7 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
                 sfr_freq, (-rigid_shts[0], -rigid_shts[1], -rigid_shts[2]), diffphase, border_nan=border_nan)
             img_show = np.vstack([new_img, img])
 
-            img_show = resize_sk(img_show, None, fx=1, fy=1, fz=1)
+            img_show = rescale_sk(img_show, 1)  # TODO does this actually do anything??
 
             cv2.imshow('frame', img_show / np.percentile(template, 99))
             cv2.waitKey(int(1. / 500 * 1000))
@@ -2583,6 +2528,117 @@ def tile_and_correct_3d(img:np.ndarray, template:np.ndarray, strides:tuple, over
             except:
                 pass
         return new_img - add_to_movie, total_shifts, start_step, xyz_grid
+    
+def apply_pw_shifts_remap_2d(img: np.ndarray, shifts_y: np.ndarray, shifts_x: np.ndarray,
+                             patch_centers: tuple[list[float], ...], border_nan: Union[bool, Literal['copy', 'min']],
+                             shifts_interpolate=False) -> np.ndarray:
+    """
+    Use OpenCV remap to apply 2D piecewise shifts
+    Inputs:
+        img: the 2D image to apply shifts to
+        shifts_y: array of y shifts for each patch (C order) (this is the actual Y i.e. the first dimension of the image)
+        shifts_x: array of x shifts for each patch (C order)
+        patch_centers: tuple of patch locations in each dimension.
+        border_nan: how to deal with borders when remapping
+        shifts_interpolate: if true, uses interpn to upsample shifts based on patch centers instead of resize
+    Outputs:
+        img_remapped: the remapped image
+    """
+    # reshape shifts_y and shifts_x based on patch grid
+    patch_grid = tuple(len(centers) for centers in patch_centers)
+    shift_img_y = np.reshape(shifts_y, patch_grid)
+    shift_img_x = np.reshape(shifts_x, patch_grid)
+
+    # get full image shape/coordinates
+    dims = img.shape
+    x_coords, y_coords = [np.arange(0., dims[dim]).astype(np.float32) for dim in (1, 0)]
+    x_grid, y_grid = np.meshgrid(x_coords, y_coords)
+
+    # up-sample shifts
+    if shifts_interpolate:
+        shifts_y = interpolate_shifts(shift_img_y, patch_centers, (y_coords, x_coords)).astype(np.float32)
+        shifts_x = interpolate_shifts(shift_img_x, patch_centers, (y_coords, x_coords)).astype(np.float32)
+    else:
+        shifts_y = cv2.resize(shift_img_y.astype(np.float32), dims[::-1])
+        shifts_x = cv2.resize(shift_img_x.astype(np.float32), dims[::-1])
+    
+    # apply to image
+    if border_nan is False:
+        mode = cv2.BORDER_CONSTANT
+        value = 0.0
+    elif border_nan is True:
+        mode = cv2.BORDER_CONSTANT
+        value = np.nan
+    elif border_nan == 'min':
+        mode = cv2.BORDER_CONSTANT
+        value = np.min(img)
+    elif border_nan == 'copy':
+        mode = cv2.BORDER_REPLICATE
+        value = 0.0
+    else:
+        raise ValueError(f'Unknown value of border_nan ({border_nan})')
+    
+    return cv2.remap(img, shifts_x + x_grid, shifts_y + y_grid, cv2.INTER_CUBIC,
+                     borderMode=mode, borderValue=value)
+
+def apply_pw_shifts_remap_3d(img: np.ndarray, shifts_y: np.ndarray, shifts_x: np.ndarray, shifts_z: np.ndarray,
+                             patch_centers: tuple[list[float], ...], border_nan: Union[bool, Literal['copy', 'min']],
+                             shifts_interpolate=False) -> np.ndarray:
+    """
+    Use skimage warp to apply 3D piecewise shifts
+    Inputs:
+        img: the 3D image to apply shifts to
+        shifts_y: array of y shifts for each patch (C order) (this is the actual Y i.e. the first dimension of the image)
+        shifts_x: array of x shifts for each patch (C order)
+        shifts_z: array of z shifts for each patch (C order)
+        patch_centers: tuple of patch locations in each dimension.
+        border_nan: how to deal with borders when remapping
+        shifts_interpolate: if true, uses interpn to upsample shifts based on patch centers instead of resize
+    Outputs:
+        img_remapped: the remapped image
+    """
+    # reshape shifts based on patch grid
+    patch_grid = tuple(len(centers) for centers in patch_centers)
+    shift_img_y = np.reshape(shifts_y, patch_grid)
+    shift_img_x = np.reshape(shifts_x, patch_grid)
+    shift_img_z = np.reshape(shifts_z, patch_grid)
+
+    # get full image shape/coordinates
+    dims = img.shape
+    x_coords, y_coords, z_coords = [np.arange(0., dims[dim]).astype(np.float32) for dim in (1, 0, 2)]
+    x_grid, y_grid, z_grid = np.meshgrid(x_coords, y_coords, z_coords)
+
+    # up-sample shifts
+    if shifts_interpolate:
+        coords_new = (y_coords, x_coords, z_coords)
+        shifts_y = interpolate_shifts(shift_img_y, patch_centers, coords_new).astype(np.float32)
+        shifts_x = interpolate_shifts(shift_img_x, patch_centers, coords_new).astype(np.float32)
+        shifts_z = interpolate_shifts(shift_img_z, patch_centers, coords_new).astype(np.float32)
+    else:
+        shifts_y = resize_sk(shift_img_y.astype(np.float32), dims)
+        shifts_x = resize_sk(shift_img_x.astype(np.float32), dims)
+        shifts_z = resize_sk(shift_img_z.astype(np.float32), dims)
+    
+    shift_map = np.stack((shifts_y + y_grid, shifts_x + x_grid, shifts_z + z_grid), axis=0)
+    
+    # apply to image
+    if border_nan is False:
+        mode = 'constant'
+        value = 0.0
+    elif border_nan is True:
+        mode = 'constant'
+        value = np.nan
+    elif border_nan == 'min':
+        mode = 'constant'
+        value = np.min(img)
+    elif border_nan == 'copy':
+        mode = 'edge'
+        value = 0.0
+    else:
+        raise ValueError(f'Unknown value of border_nan ({border_nan})')
+
+    return warp_sk(img, shift_map, order=3, mode=mode, cval=value)
+
 
 def compute_flow_single_frame(frame, templ, pyr_scale=.5, levels=3, winsize=100, iterations=15, poly_n=5,
                               poly_sigma=1.2 / 5, flags=0):
@@ -2596,10 +2652,8 @@ def compute_metrics_motion_correction(fname, final_size_x, final_size_y, swap_di
                                       opencv=True, resize_fact_play=3, fr_play=30, max_flow=1,
                                       gSig_filt=None):
     #todo: todocument
-    # cv2.OPTFLOW_FARNEBACK_GAUSSIAN
-    import scipy
-    from tqdm import tqdm
-    if os.environ.get('ENABLE_TQDM') == 'True':
+    logger = logging.getLogger("caiman")
+    if os.environ.get('ENABLE_TQDM') == 'True': # TODO Find a better way to toggle this or remove the code; this is also not documented anywhere
         disable_tqdm = False
     else:
         disable_tqdm = True
@@ -2621,40 +2675,40 @@ def compute_metrics_motion_correction(fname, final_size_x, final_size_y, swap_di
 
     if max_shft_y_1 == 0:
         max_shft_y_1 = None
-    logging.info([max_shft_x, max_shft_x_1, max_shft_y, max_shft_y_1])
+    logger.info([max_shft_x, max_shft_x_1, max_shft_y, max_shft_y_1])
     m = m[:, max_shft_x:max_shft_x_1, max_shft_y:max_shft_y_1]
     if np.sum(np.isnan(m)) > 0:
-        logging.info(m.shape)
-        logging.warning('Movie contains NaN')
+        logger.info(m.shape)
+        logger.warning('Movie contains NaN')
         raise Exception('Movie contains NaN')
 
-    logging.debug('Local correlations..')
+    logger.debug('Local correlations..')
     img_corr = m.local_correlations(eight_neighbours=True, swap_dim=swap_dim)
-    logging.debug(m.shape)
+    logger.debug(m.shape)
     if template is None:
         tmpl = caiman.motion_correction.bin_median(m)
     else:
         tmpl = template
 
-    logging.debug('Compute Smoothness.. ')
+    logger.debug('Compute Smoothness.. ')
     smoothness = np.sqrt(
         np.sum(np.sum(np.array(np.gradient(np.mean(m, 0)))**2, 0)))
     smoothness_corr = np.sqrt(
         np.sum(np.sum(np.array(np.gradient(img_corr))**2, 0)))
 
-    logging.debug('Compute correlations.. ')
+    logger.debug('Computing correlations.. ')
     correlations = []
     count = 0
     sys.stdout.flush()
     for fr in tqdm(m, desc="Correlations", disable=disable_tqdm):
         if disable_tqdm:
             if count % 100 == 0:
-                logging.debug(count)
+                logger.debug(count)
         count += 1
         correlations.append(scipy.stats.pearsonr(
             fr.flatten(), tmpl.flatten())[0])
 
-    logging.info('Compute optical flow .. ')
+    logger.info('Computing optical flow.. ')
 
     m = m.resize(1, 1, resize_fact_flow)
     norms = []
@@ -2664,7 +2718,7 @@ def compute_metrics_motion_correction(fname, final_size_x, final_size_y, swap_di
     for fr in tqdm(m, desc="Optical flow", disable=disable_tqdm):
         if disable_tqdm:
             if count % 100 == 0:
-                logging.debug(count)
+                logger.debug(count)
 
 
         count += 1
@@ -2727,7 +2781,8 @@ def compute_metrics_motion_correction(fname, final_size_x, final_size_y, swap_di
 def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_splits_to_process=None, num_iter=1,
                                template=None, shifts_opencv=False, save_movie_rigid=False, add_to_movie=None,
                                nonneg_movie=False, gSig_filt=None, subidx=slice(None, None, 1), use_cuda=False,
-                               border_nan=True, var_name_hdf5='mov', is3D=False, indices=(slice(None), slice(None))):
+                               border_nan=True, var_name_hdf5='mov', is3D=False, indices=(slice(None), slice(None)),
+                               shifts_interpolate=False):
     """
     Function that perform memory efficient hyper parallelized rigid motion corrections while also saving a memory mappable file
 
@@ -2753,17 +2808,17 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
         template: ndarray
             if a good approximation of the template to register is available, it can be used
 
-        shifts_opencv: boolean
+        shifts_opencv: bool
              toggle the shifts applied with opencv, if yes faster but induces some smoothing
 
-        save_movie_rigid: boolean
+        save_movie_rigid: bool
              toggle save movie
 
         subidx: slice
             Indices to slice
 
-        use_cuda : bool, optional
-            Use skcuda.fft (if available). Default: False
+        use_cuda : bool (DEPRECATED)
+            cuda is no longer supported for motion correction; this kwarg will be removed in a future version of Caiman
 
         indices: tuple(slice), default: (slice(None), slice(None))
            Use that to apply motion correction only on a part of the FOV
@@ -2783,6 +2838,7 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
         Exception 'The movie contains nans. Nans are not allowed!'
 
     """
+    logger = logging.getLogger("caiman")
 
     dims, T = caiman.base.movies.get_file_size(fname, var_name_hdf5=var_name_hdf5)
     Ts = np.arange(T)[subidx].shape[0]
@@ -2793,9 +2849,9 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
     if len(m.shape) < 3:
         m = caiman.load(fname, var_name_hdf5=var_name_hdf5)
         m = m[corrected_slicer]
-        logging.warning("Your original file was saved as a single page " +
-                        "file. Consider saving it in multiple smaller files" +
-                        "with size smaller than 4GB (if it is a .tif file)")
+        logger.warning("Your original file was saved as a single page " +
+                       "file. Consider saving it in multiple smaller files" +
+                       "with size smaller than 4GB (if it is a .tif file)")
 
     if is3D:
         m = m[:, indices[0], indices[1], indices[2]]
@@ -2809,8 +2865,6 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
         if is3D:     
             # TODO - motion_correct_3d needs to be implemented in movies.py
             template = caiman.motion_correction.bin_median_3d(m) # motion_correct_3d has not been implemented yet - instead initialize to just median image
-#            template = caiman.motion_correction.bin_median_3d(
-#                    m.motion_correct_3d(max_shifts[2], max_shifts[1], max_shifts[0], template=None)[0])
         else:
             if not m.flags['WRITEABLE']:
                 m = m.copy()
@@ -2822,20 +2876,20 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
         add_to_movie = -np.min(template)
 
     if np.isnan(add_to_movie):
-        logging.error('The movie contains NaNs. NaNs are not allowed!')
+        logger.error('The movie contains NaNs. NaNs are not allowed!')
         raise Exception('The movie contains NaNs. NaNs are not allowed!')
     else:
-        logging.debug('Adding to movie ' + str(add_to_movie))
+        logger.debug(f'Adding to movie {add_to_movie}')
 
     save_movie = False
     fname_tot_rig = None
     res_rig:list = []
     for iter_ in range(num_iter):
-        logging.debug(iter_)
+        logger.debug(iter_)
         old_templ = new_templ.copy()
         if iter_ == num_iter - 1:
             save_movie = save_movie_rigid
-            logging.debug('saving!')
+            logger.debug('saving!')
 
 
         if isinstance(fname, tuple):
@@ -2848,15 +2902,13 @@ def motion_correct_batch_rigid(fname, max_shifts, dview=None, splits=56, num_spl
                                                              dview=dview, save_movie=save_movie, base_name=base_name, subidx = subidx,
                                                              num_splits=num_splits_to_process, shifts_opencv=shifts_opencv, nonneg_movie=nonneg_movie, gSig_filt=gSig_filt,
                                                              use_cuda=use_cuda, border_nan=border_nan, var_name_hdf5=var_name_hdf5, is3D=is3D,
-                                                             indices=indices)
+                                                             indices=indices, shifts_interpolate=shifts_interpolate)
         if is3D:
             new_templ = np.nanmedian(np.stack([r[-1] for r in res_rig]), 0)           
         else:
             new_templ = np.nanmedian(np.dstack([r[-1] for r in res_rig]), -1)
         if gSig_filt is not None:
             new_templ = high_pass_filter_space(new_templ, gSig_filt)
-
-#        logging.debug((np.linalg.norm(new_templ - old_templ) / np.linalg.norm(old_templ)))
 
     total_template = new_templ
     templates = []
@@ -2873,7 +2925,7 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
                                  splits=56, num_splits_to_process=None, num_iter=1,
                                  template=None, shifts_opencv=False, save_movie=False, nonneg_movie=False, gSig_filt=None,
                                  use_cuda=False, border_nan=True, var_name_hdf5='mov', is3D=False,
-                                 indices=(slice(None), slice(None))):
+                                 indices=(slice(None), slice(None)), shifts_interpolate=False):
     """
     Function that perform memory efficient hyper parallelized rigid motion corrections while also saving a memory mappable file
 
@@ -2911,14 +2963,14 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
         template: ndarray
             if a good approximation of the template to register is available, it can be used
 
-        shifts_opencv: boolean
+        shifts_opencv: bool
              toggle the shifts applied with opencv, if yes faster but induces some smoothing
 
-        save_movie_rigid: boolean
+        save_movie_rigid: bool
              toggle save movie
 
-        use_cuda : bool, optional
-            Use skcuda.fft (if available). Default: False
+        use_cuda : bool (DEPRECATED)
+            cuda is no longer supported for motion correction; this kwarg will be removed in a future version of Caiman
 
         indices: tuple(slice), default: (slice(None), slice(None))
            Use that to apply motion correction only on a part of the FOV
@@ -2938,6 +2990,8 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
         Exception 'You need to initialize the template with a good estimate. See the motion'
                         '_correct_batch_rigid function'
     """
+    logger = logging.getLogger("caiman")
+
     if template is None:
         raise Exception('You need to initialize the template with a good estimate. See the motion'
                         '_correct_batch_rigid function')
@@ -2945,13 +2999,13 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
         new_templ = template
 
     if np.isnan(add_to_movie):
-        logging.error('The template contains NaNs. NaNs are not allowed!')
+        logger.error('The template contains NaNs. NaNs are not allowed!')
         raise Exception('The template contains NaNs. NaNs are not allowed!')
     else:
-        logging.debug('Adding to movie ' + str(add_to_movie))
+        logger.debug(f'Adding to movie {add_to_movie}')
 
     for iter_ in range(num_iter):
-        logging.debug(iter_)
+        logger.debug(iter_)
         old_templ = new_templ.copy()
 
         if iter_ == num_iter - 1:
@@ -2959,11 +3013,11 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
             if save_movie:
 
                 if isinstance(fname, tuple):
-                    logging.debug(f'saving mmap of {fname[0]} to {fname[-1]}')
+                    logger.debug(f'saving mmap of {fname[0]} to {fname[-1]}')
                 else:
-                    logging.debug(f'saving mmap of {fname}')
+                    logger.debug(f'saving mmap of {fname}')
 
-        if isinstance(fname, tuple):
+        if isinstance(fname, tuple): # TODO Switch to using standard path functions
             base_name=os.path.splitext(os.path.split(fname[0])[-1])[0] + '_els_'
         else:
             base_name=os.path.splitext(os.path.split(fname)[-1])[0] + '_els_'
@@ -2976,7 +3030,7 @@ def motion_correct_batch_pwrigid(fname, max_shifts, strides, overlaps, add_to_mo
                                                             base_name=base_name, num_splits=num_splits_to_process,
                                                             shifts_opencv=shifts_opencv, nonneg_movie=nonneg_movie, gSig_filt=gSig_filt,
                                                             use_cuda=use_cuda, border_nan=border_nan, var_name_hdf5=var_name_hdf5, is3D=is3D,
-                                                            indices=indices)
+                                                            indices=indices, shifts_interpolate=shifts_interpolate)
         if is3D:
             new_templ = np.nanmedian(np.stack([r[-1] for r in res_el]), 0)
         else:
@@ -3021,7 +3075,7 @@ def tile_and_correct_wrapper(params):
 
     """
     # todo todocument
-
+    logger = logging.getLogger("caiman")
 
     try:
         cv2.setNumThreads(0)
@@ -3031,7 +3085,7 @@ def tile_and_correct_wrapper(params):
     img_name, out_fname, idxs, shape_mov, template, strides, overlaps, max_shifts,\
         add_to_movie, max_deviation_rigid, upsample_factor_grid, newoverlaps, newstrides, \
         shifts_opencv, nonneg_movie, gSig_filt, is_fiji, use_cuda, border_nan, var_name_hdf5, \
-        is3D, indices = params
+        is3D, indices, shifts_interpolate = params
 
 
     if isinstance(img_name, tuple):
@@ -3048,7 +3102,7 @@ def tile_and_correct_wrapper(params):
         template = template[indices]
     for count, img in enumerate(imgs):
         if count % 10 == 0:
-            logging.debug(count)
+            logger.debug(count)
         if is3D:
             mc[count], total_shift, start_step, xyz_grid = tile_and_correct_3d(img, template, strides, overlaps, max_shifts,
                                                                        add_to_movie=add_to_movie, newoverlaps=newoverlaps,
@@ -3057,7 +3111,8 @@ def tile_and_correct_wrapper(params):
                                                                        upsample_factor_fft=10, show_movie=False,
                                                                        max_deviation_rigid=max_deviation_rigid,
                                                                        shifts_opencv=shifts_opencv, gSig_filt=gSig_filt,
-                                                                       use_cuda=use_cuda, border_nan=border_nan)
+                                                                       use_cuda=use_cuda, border_nan=border_nan,
+                                                                       shifts_interpolate=shifts_interpolate)
             shift_info.append([total_shift, start_step, xyz_grid])
             
         else:
@@ -3068,7 +3123,8 @@ def tile_and_correct_wrapper(params):
                                                                        upsample_factor_fft=10, show_movie=False,
                                                                        max_deviation_rigid=max_deviation_rigid,
                                                                        shifts_opencv=shifts_opencv, gSig_filt=gSig_filt,
-                                                                       use_cuda=use_cuda, border_nan=border_nan)
+                                                                       use_cuda=use_cuda, border_nan=border_nan,
+                                                                       shifts_interpolate=shifts_interpolate)
             shift_info.append([total_shift, start_step, xy_grid])
 
     if out_fname is not None:
@@ -3089,11 +3145,12 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
                                 upsample_factor_grid=4, order='F', dview=None, save_movie=True,
                                 base_name=None, subidx = None, num_splits=None, shifts_opencv=False, nonneg_movie=False, gSig_filt=None,
                                 use_cuda=False, border_nan=True, var_name_hdf5='mov', is3D=False,
-                                indices=(slice(None), slice(None))):
+                                indices=(slice(None), slice(None)), shifts_interpolate=False):
     """
 
     """
     # todo todocument
+    logger = logging.getLogger("caiman")
     if isinstance(fname, tuple):
         name, extension = os.path.splitext(fname[0])[:2]
     else:
@@ -3104,7 +3161,7 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
     dims, T = caiman.base.movies.get_file_size(fname, var_name_hdf5=var_name_hdf5)
     z = np.zeros(dims)
     dims = z[indices].shape
-    logging.debug(f'Number of Splits: {splits}')
+    logger.debug(f'Number of Splits: {splits}')
     if isinstance(splits, int):
         if subidx is None:
             rng = range(T)
@@ -3123,7 +3180,7 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
     if num_splits is not None:
         idxs = np.array(idxs)[np.random.randint(0, len(idxs), num_splits)]
         save_movie = False
-        #logging.warning('**** MOVIE NOT SAVED BECAUSE num_splits is not None ****')
+        logger.warning('**** Movie not saved because num_splits is not None ****')
 
     if save_movie:
         if base_name is None:
@@ -3133,30 +3190,28 @@ def motion_correction_piecewise(fname, splits, strides, overlaps, add_to_movie=0
 
         np.memmap(fname_tot, mode='w+', dtype=np.float32,
                   shape=caiman.mmapping.prepare_shape(shape_mov), order=order)
-        logging.info(f'Saving file as {fname_tot}')
+        logger.info(f'Saving file as {fname_tot}')
     else:
         fname_tot = None
 
     pars = []
     for idx in idxs:
-        logging.debug(f'Extracting parameters for frames: {idx}')
+        logger.debug(f'Extracting parameters for frames: {idx}')
         pars.append([fname, fname_tot, idx, shape_mov, template, strides, overlaps, max_shifts, np.array(
             add_to_movie, dtype=np.float32), max_deviation_rigid, upsample_factor_grid,
             newoverlaps, newstrides, shifts_opencv, nonneg_movie, gSig_filt, is_fiji,
-            use_cuda, border_nan, var_name_hdf5, is3D, indices])
+            use_cuda, border_nan, var_name_hdf5, is3D, indices, shifts_interpolate])
 
     if dview is not None:
-        logging.info('** Starting parallel motion correction **')
-        if HAS_CUDA and use_cuda:
-            res = dview.map(tile_and_correct_wrapper,pars)
-            dview.map(close_cuda_process, range(len(pars)))
-        elif 'multiprocessing' in str(type(dview)):
-            logging.debug("entering multiprocessing tile_and_correct_wrapper")
+        logger.info('** Starting parallel motion correction **')
+        if 'multiprocessing' in str(type(dview)):
+            logger.debug("entering multiprocessing tile_and_correct_wrapper")
             res = dview.map_async(tile_and_correct_wrapper, pars).get(4294967)
         else:
             res = dview.map_sync(tile_and_correct_wrapper, pars)
-        logging.info('** Finished parallel motion correction **')
+        logger.info('** Finished parallel motion correction **')
     else:
         res = list(map(tile_and_correct_wrapper, pars))
 
     return fname_tot, res
+

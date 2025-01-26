@@ -1,6 +1,5 @@
 channels:
 - conda-forge
-- defaults
 dependencies:
 - python <=3.12
 - av
@@ -17,12 +16,13 @@ dependencies:
 - matplotlib
 - moviepy
 - mypy
-- nose
+- pytest
+- pytest-cov
 - numpy <2.0.0,>=1.26
 - numpydoc
 - opencv
 - panel >=1.0.2
-- peakutils
+- peakutils >=1.3.5
 - pims
 - psutil
 - pynwb
